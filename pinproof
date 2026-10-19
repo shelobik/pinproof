@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""pinproof — score proof tools for Visual Pinball X on Linux, for World of Virtual Pinball (WoVP) challenges.
+
+  patch       add the WoVP telemetry to a table (same patch as the official WoVP Patcher)
+  challenges  list the active WoVP challenges and your current score in each
+  submit      upload a score screenshot to the matching challenge (WHSC API)
+  logs        list or clean up the telemetry logs
+
+Not affiliated with WoVP. The WoVP telemetry script is not part of this tool: it is read from the official WoVP
+Patcher download (setting `patcher`). Python 3.11+, standard library only; needs vpxtool for `patch`.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import urllib.error
+import urllib.request
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "0.1.0"
+API = "https://worldofvirtualpinball.com/api/whsc/v1"
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "pinproof" / "config.toml"
+DEFAULTS = {
+    "api_key": "",
+    "client_id": "pinproof",             # X-Client-ID registered with WoVP for this tool
+    "vpxtool": "vpxtool",
+    "patcher": "",                       # WoVP Patcher folder, or its bin/wovp_script.vbs
+    "log_dir": "~/vpin_logs",
+    "screenshot_command": "",            # e.g. "grim {file}" or "spectacle -b -n -f -o {file}"
+    "temp_dir": "",                      # where tables are extracted while patching (default: next to the table)
+    "backup_suffix": ".bak",             # original kept as <table>.vpx<suffix> (like the official patcher)
+    "keep_days": 14,
+    "keep_submitted_days": 60,
+    "gamename_fix": True,
+    "on_screenshot": "",                 # `submit` hooks: commands run (not waited for) with {message} replaced,
+    "on_success": "",                    # e.g. an on-screen message or a rumble on a cabinet
+    "on_error": "",
+}
+TIMERS = (("WoVP_Timer", 1000), ("WoVP_FastTimer", 50))
+
+
+class Fail(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- config / helpers
+
+def load_config(path):
+    cfg = dict(DEFAULTS)
+    if path.exists():
+        with open(path, "rb") as f:
+            cfg.update(tomllib.load(f))
+    if os.environ.get("PINPROOF_API_KEY"):
+        cfg["api_key"] = os.environ["PINPROOF_API_KEY"]
+    return cfg
+
+
+def log_dir(cfg):
+    return Path(os.path.expanduser(cfg["log_dir"]))
+
+
+def notify(title, body, error=False):
+    print(f"{title}: {body}", file=sys.stderr if error else sys.stdout)
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "pinproof", "-t", "8000", *(["-u", "critical"] if error else []),
+                        title, body], check=False)
+
+
+def hook(cfg, name, message):
+    """Run a `submit` hook command from the config in the background; {message} is replaced (a separate argument)."""
+    cmd = cfg.get(name) or ""
+    if not cmd:
+        return
+    parts = [p.replace("{message}", message) for p in shlex.split(cmd)]
+    try:
+        subprocess.Popen(parts, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        print(f"{name}: {e}", file=sys.stderr)
+
+
+def sanitize(s):
+    """Same as WoVP_Sanitize in the telemetry script (log file names)."""
+    return re.sub(r"[^A-Za-z0-9_]", "_", s)
+
+
+# ---------------------------------------------------------------- WHSC API
+
+def api(cfg, path, body=None, files=None):
+    if not cfg["api_key"]:
+        raise Fail(f"no api_key in {CONFIG} (get it at https://worldofvirtualpinball.com/en/challenge/settings?tab=general)")
+    headers = {"X-Client-ID": cfg["client_id"], "Authorization": f"Bearer {cfg['api_key']}",
+               "User-Agent": f"pinproof/{VERSION}"}
+    if files:
+        boundary = uuid.uuid4().hex
+        data = b""
+        for field, (name, content, ctype) in files.items():
+            data += (f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{name}"\r\n'
+                     f"Content-Type: {ctype}\r\n\r\n").encode() + content + b"\r\n"
+        data += f"--{boundary}--\r\n".encode()
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    else:
+        data = json.dumps(body or {}).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(API + path, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            text = r.read().decode()
+    except urllib.error.HTTPError as e:
+        raise Fail(f"{path}: HTTP {e.code} {e.read().decode(errors='replace')[:200]}")
+    except urllib.error.URLError as e:
+        raise Fail(f"{path}: {e.reason}")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise Fail(f"{path}: unexpected answer {text[:200]}")
+
+
+def user_id(cfg):
+    r = api(cfg, "/validate-apikey", {"apikey": cfg["api_key"]})
+    if not r.get("success"):
+        raise Fail("API key not valid")
+    return r["userId"], f"{r.get('firstName', '')} {r.get('lastName', '')}".strip()
+
+
+def active_challenges(cfg, scoreboard=False):
+    expands = ["challenge.pinballTable.minimum", "challenge.pinballTableVersion.minimum", "challenge.scriptMatchKeywords"]
+    if scoreboard:
+        expands.append("challenge.scoreboard")
+    r = api(cfg, "/challenges/search",
+            {"cultureCode": "en", "filters": {"statuses": [1], "inProgress": True}, "expands": expands})
+    if not isinstance(r.get("items"), list):
+        raise Fail(f"challenge search: unexpected answer {str(r)[:200]}")
+    return r["items"]
+
+
+def my_best(challenge, uid):
+    scores = [i["values"] for i in (challenge.get("scoreboard") or {}).get("items", [])
+              if i.get("values", {}).get("UserId") == uid]
+    return max(scores, key=lambda v: v.get("Score") or 0) if scores else None
+
+
+# ---------------------------------------------------------------- tables
+
+def running_table():
+    """The .vpx of a running VPinballX (command line ... -play <file>.vpx)."""
+    for p in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            args = p.read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if not args or "VPinballX" not in Path(args[0].decode(errors="replace")).name:
+            continue
+        for i, a in enumerate(args[:-1]):
+            if a.lower() in (b"-play", b"/play"):
+                vpx = Path(args[i + 1].decode(errors="replace"))
+                if vpx.suffix.lower() == ".vpx":
+                    return vpx
+    return None
+
+
+def table_vps_id(vpx):
+    """VPS game id from a VPinFE .info next to the table, if there is one."""
+    for info in vpx.parent.glob("*.info"):
+        try:
+            vps = json.loads(info.read_text(encoding="utf-8")).get("Info", {}).get("VPSId")
+        except (OSError, ValueError):
+            continue
+        if vps:
+            return vps
+    return None
+
+
+def table_script(cfg, vpx):
+    sidecar = vpx.with_suffix(".vbs")
+    if sidecar.exists():
+        return sidecar.read_text(encoding="utf-8", errors="replace")
+    try:
+        r = subprocess.run([cfg["vpxtool"], "script", "show", str(vpx)], capture_output=True, text=True, errors="replace")
+        return r.stdout
+    except OSError:
+        return ""
+
+
+def match_challenge(cfg, challenges, vpx, vps=None):
+    """Challenge for a table: by VPS id (argument or VPinFE .info), else by the challenge's script keywords."""
+    vps = vps or table_vps_id(vpx)
+    if vps:
+        hits = [c for c in challenges if (c.get("pinballTable") or {}).get("externalId") == vps]
+        if hits:
+            return hits[0], f"VPS id {vps}"
+    text = (vpx.name + "\n" + table_script(cfg, vpx)).lower()
+    scored = []
+    for c in challenges:
+        kws = [k for k in (c.get("scriptMatchKeywords") or []) if k]
+        if kws:
+            found = sum(k.lower() in text for k in kws)
+            if found == len(kws):
+                scored.append(c)
+    if len(scored) == 1:
+        return scored[0], "script keywords"
+    name_hits = [c for c in challenges if (c.get("pinballTable") or {}).get("name", "").lower() in vpx.name.lower()]
+    if len(name_hits) == 1 and not scored:
+        return name_hits[0], "table name"
+    if len(scored) > 1:
+        raise Fail("several challenges match this table: " + ", ".join(c["name"] for c in scored) + " (use --challenge)")
+    raise Fail(f"no active challenge for {vpx.name} (use --vps or --challenge)")
+
+
+# ---------------------------------------------------------------- patch
+
+def telemetry_block(cfg):
+    p = Path(os.path.expanduser(cfg["patcher"])) if cfg["patcher"] else None
+    if p and p.is_dir():
+        p = next((c for c in (p / "bin" / "wovp_script.vbs", p / "wovp_script.vbs") if c.exists()), p / "bin" / "wovp_script.vbs")
+    if not p or not p.is_file():
+        raise Fail("set `patcher` in the config to the official WoVP Patcher folder (contains bin/wovp_script.vbs)")
+    text = p.read_text(encoding="utf-8-sig")
+    if not re.search(r"(?im)^\s*Sub\s+WoVP_Timer_Timer\b", text):
+        raise Fail(f"{p} does not look like the WoVP telemetry script")
+    logdir = str(log_dir(cfg)) + "/"
+    text, n = re.subn(r'^(Const WoVP_LogDir = )".*"', lambda m: f'{m.group(1)}"{logdir}"', text, count=1, flags=re.M)
+    if n != 1:
+        raise Fail("WoVP_LogDir not found in the telemetry script")
+    if cfg["gamename_fix"]:
+        # VPX 10.8.1 (Linux builds up to at least rev 5436): the B2SLegacy plugin treats a read of
+        # Controller.GameName as a write and crashes VPX. cGameName (table constant) holds the same ROM name.
+        text = re.sub(r"(WoVP_RomName = )Controller\.GameName", r"\1cGameName", text, count=1)
+    return text
+
+
+def run_tool(cfg, *args):
+    try:
+        r = subprocess.run([cfg["vpxtool"], *args], capture_output=True, text=True, errors="replace")
+    except OSError as e:
+        raise Fail(f"vpxtool: {e} (set `vpxtool` in the config)")
+    if r.returncode:
+        raise Fail(f"vpxtool {args[0]}: {(r.stderr or r.stdout).strip()[-300:]}")
+
+
+def set_field(obj, names, value):
+    """First matching key at the root or one level down (the official patcher does the same)."""
+    for scope in [obj] + [v for v in obj.values() if isinstance(v, dict)]:
+        for k in scope:
+            if k.lower() in names:
+                scope[k] = value
+                return
+    raise Fail(f"timer template has no {names[0]}")
+
+
+def append_block(path, block):
+    raw = path.read_bytes()
+    if re.search(rb"(?im)^\s*Sub\s+WoVP_Timer_Timer\b", raw):
+        return False
+    crlf = block.replace("\r\n", "\n").replace("\n", "\r\n")
+    path.write_bytes(raw.rstrip() + b"\r\n\r\n" + crlf.encode("utf-8") + b"\r\n")
+    return True
+
+
+def patch_table(cfg, vpx, dry, backup):
+    block = telemetry_block(cfg)
+    tmp_root = Path(os.path.expanduser(cfg["temp_dir"])) if cfg["temp_dir"] else vpx.parent
+    tmp = Path(tempfile.mkdtemp(prefix=".pinproof-patch-", dir=tmp_root))
+    try:
+        ext = tmp / "x"
+        run_tool(cfg, "extract", str(vpx), "-o", str(ext))
+        index_path = ext / "gameitems.json"
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        names = [e.get("file_name", "") for e in index]
+        if any(re.search(r"WoVP_Timer|WoVP_FastTimer", n, re.I) for n in names):
+            return "already patched"
+        timers = [e for e in index if re.search(r"(^|[\\/])timer\.", e.get("file_name", ""), re.I)]
+        if not timers:
+            raise Fail("the table has no timer to use as a template")
+        tpl_entry = timers[0]
+        tpl_rel = tpl_entry["file_name"]
+        tpl_path = ext / tpl_rel if (ext / tpl_rel).exists() else ext / "gameitems" / Path(tpl_rel).name
+        tpl = json.loads(tpl_path.read_text(encoding="utf-8"))
+        prefix = Path(tpl_rel).name.split(".", 1)[0]
+        for name, interval in TIMERS:
+            item = json.loads(json.dumps(tpl))
+            set_field(item, ("name",), name)
+            set_field(item, ("timer_interval", "interval"), interval)
+            set_field(item, ("is_timer_enabled", "is_enabled", "isenabled", "enabled"), True)
+            leaf = f"{prefix}.{re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_')}.json"
+            (tpl_path.parent / leaf).write_text(json.dumps(item, indent=2), encoding="utf-8")
+            entry = dict(tpl_entry)
+            sep = "\\" if "\\" in tpl_rel else "/"
+            entry["file_name"] = tpl_rel.rsplit(sep, 1)[0] + sep + leaf if sep in tpl_rel else leaf
+            index.append(entry)
+        index_path.write_text(json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8")
+        scripts = list(ext.rglob("*.vbs"))
+        if len(scripts) != 1:
+            raise Fail(f"expected one script in the extracted table, found {len(scripts)}")
+        append_block(scripts[0], block)
+        out = tmp / vpx.name
+        run_tool(cfg, "assemble", str(ext), str(out))
+        run_tool(cfg, "verify", str(out))
+        sidecar = vpx.with_suffix(".vbs")
+        if dry:
+            return "dry run OK" + (" (would also patch the sidecar .vbs)" if sidecar.exists() else "")
+        bak = vpx.with_name(vpx.name + backup)
+        if backup and not bak.exists():
+            shutil.copy2(vpx, bak)
+        shutil.move(str(out), str(vpx))
+        note = ""
+        if sidecar.exists():
+            note = " + sidecar .vbs" if append_block(sidecar, block) else " (sidecar .vbs already had it)"
+        return "patched" + note + (f", original kept as {bak.name}" if backup else "")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_patch(cfg, a):
+    rc = 0
+    for t in a.tables:
+        vpx = Path(t).expanduser().resolve()
+        try:
+            if vpx.suffix.lower() != ".vpx" or not vpx.is_file():
+                raise Fail("not a .vpx file")
+            if running_table() == vpx and not a.dry_run:
+                raise Fail("the table is running, close VPX first")
+            print(f"✓ {vpx.name}: {patch_table(cfg, vpx, a.dry_run, '' if a.no_backup else cfg['backup_suffix'])}")
+        except Fail as e:
+            print(f"✗ {vpx.name}: {e}", file=sys.stderr)
+            rc = 1
+    print(f"Logs go to {log_dir(cfg)}/")
+    return rc
+
+
+# ---------------------------------------------------------------- challenges
+
+def cmd_challenges(cfg, a):
+    uid, who = user_id(cfg)
+    items = active_challenges(cfg, scoreboard=True)
+    if a.json:
+        print(json.dumps(items, indent=2))
+        return 0
+    print(f"Active WoVP challenges ({who}):")
+    for c in items:
+        t = c.get("pinballTable") or {}
+        best = my_best(c, uid)
+        mine = "—"
+        if best:
+            state = "pending" if best.get("IsPending") else f"#{best.get('Position')}"
+            mine = f"{best.get('Score') or 0:,} ({state})"
+        print(f"\n  {c['name']}\n    type {c.get('challengeTypeCode')}, ends {c.get('endDateUTC', '')[:16].replace('T', ' ')} UTC"
+              f"\n    VPS {t.get('externalId')}, version: {(c.get('pinballTableVersion') or {}).get('name', '?')}"
+              f"\n    keywords: {', '.join(c.get('scriptMatchKeywords') or []) or '—'}\n    your score: {mine}")
+    return 0
+
+
+# ---------------------------------------------------------------- submit
+
+def screenshot(cfg, out):
+    cmd = cfg["screenshot_command"]
+    if not cmd:
+        raise Fail("no screenshot: use --image FILE or set `screenshot_command` in the config")
+    parts = [p.replace("{file}", str(out)) for p in shlex.split(cmd)]
+    if "{file}" not in cmd:
+        parts.append(str(out))
+    try:
+        r = subprocess.run(parts, capture_output=True, text=True)
+    except OSError as e:
+        raise Fail(f"screenshot command failed: {e} (use a full path in screenshot_command)")
+    if r.returncode or not out.exists():
+        raise Fail(f"screenshot command failed: {(r.stderr or r.stdout).strip()[-200:]}")
+    return out
+
+
+def mark_log(cfg, vpx, challenge_name, score):
+    """Keep this table's newest telemetry log for the admins: hard link in submitted/ + a line in submitted.tsv."""
+    d = log_dir(cfg)
+    rom = ""
+    m = re.search(r'(?im)^\s*Const\s+cGameName\s*=\s*"([^"]+)"', table_script(cfg, vpx))
+    if m:
+        rom = m.group(1)
+    logs = sorted(d.glob(f"WoVP_{sanitize(rom)}_*.log" if rom else "WoVP_*.log"), key=lambda p: p.stat().st_mtime)
+    log = logs[-1] if logs else None
+    if log:
+        (d / "submitted").mkdir(parents=True, exist_ok=True)
+        dest = d / "submitted" / log.name
+        if not dest.exists():
+            os.link(log, dest)
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / "submitted.tsv", "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}\t{challenge_name}\t{vpx.name}\t{score}\t{log.name if log else ''}\n")
+    return log
+
+
+def cmd_submit(cfg, a):
+    vpx = Path(a.table).expanduser().absolute() if a.table else running_table()
+    if not vpx:
+        raise Fail("no table given and no running VPX found")
+    challenges = active_challenges(cfg)
+    if a.challenge:
+        ch = next((c for c in challenges if c["id"] == a.challenge), None)
+        if not ch:
+            raise Fail(f"challenge {a.challenge} is not active")
+        how = "--challenge"
+    else:
+        ch, how = match_challenge(cfg, challenges, vpx, a.vps)
+    end = ch.get("endDateUTC", "")[:16].replace("T", " ")
+    print(f"Table:     {vpx.name}\nChallenge: {ch['name']} [{ch.get('challengeTypeCode')}, ends {end} UTC] (matched by {how})")
+    with tempfile.TemporaryDirectory(prefix="pinproof-") as tmp:
+        img = Path(a.image).expanduser() if a.image else screenshot(cfg, Path(tmp) / "score.png")
+        if not img.is_file():
+            raise Fail(f"image not found: {img}")
+        if img.suffix.lower() not in (".jpg", ".jpeg") and shutil.which("magick"):
+            jpg = Path(tmp) / "score.jpg"
+            if subprocess.run(["magick", str(img), "-quality", "90", str(jpg)]).returncode == 0:
+                img = jpg
+        print(f"Image:     {img}")
+        hook(cfg, "on_screenshot", f"Screenshot taken — submitting to {ch['name']}…")
+        if a.dry_run:
+            print("Dry run: nothing sent.")
+            hook(cfg, "on_success", f"Dry run — nothing sent ({ch['name']})")
+            return 0
+        ctype = "image/jpeg" if img.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+        up = api(cfg, "/scores/submit-photo", files={"file": (img.name, img.read_bytes(), ctype)})
+        photo = (up.get("data") or {}).get("photoTempId")
+        if not photo:
+            raise Fail(f"photo upload: unexpected answer {str(up)[:200]}")
+    api(cfg, "/scores/submit", {
+        "challengeId": ch["id"], "photoTempId": photo, "score": a.score, "note": a.note or "", "playingPlatform": 0,
+        "metadata": {"pinproof-version": VERSION, "vpx-file": vpx.name},
+    })
+    log = mark_log(cfg, vpx, ch["name"], a.score)
+    notify("Score submitted", f"{ch['name']} — waiting for approval" + (f". Log: {log.name}" if log else ""))
+    hook(cfg, "on_success", f"Score submitted — {ch['name']}")
+    return 0
+
+
+# ---------------------------------------------------------------- logs
+
+def cmd_logs(cfg, a):
+    d = log_dir(cfg)
+    if a.action == "clean":
+        n = 0
+        now = time.time()
+        for folder, days in ((d, cfg["keep_days"]), (d / "submitted", cfg["keep_submitted_days"])):
+            for f in folder.glob("WoVP_*.log") if folder.is_dir() else []:
+                if now - f.stat().st_mtime > days * 86400:
+                    print(("would delete " if a.dry_run else "deleted ") + str(f))
+                    if not a.dry_run:
+                        f.unlink()
+                    n += 1
+        print(f"{n} old log(s)" + (" (dry run)" if a.dry_run else ""))
+        return 0
+    if not d.is_dir():
+        print(f"no logs yet ({d})")
+        return 0
+    for f in sorted(d.glob("WoVP_*.log"), key=lambda p: p.stat().st_mtime):
+        sub = (d / "submitted" / f.name).exists()
+        print(f"{datetime.fromtimestamp(f.stat().st_mtime):%Y-%m-%d %H:%M}  {f.name}{'  [submitted]' if sub else ''}")
+    tsv = d / "submitted.tsv"
+    if tsv.exists():
+        print(f"\nSubmitted (from {tsv.name}):")
+        print(tsv.read_text(encoding="utf-8").rstrip())
+    return 0
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="pinproof", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--config", type=Path, default=CONFIG, help=f"config file (default {CONFIG})")
+    ap.add_argument("--version", action="version", version=f"pinproof {VERSION}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("patch", help="add the WoVP telemetry to tables (needs vpxtool and the official WoVP Patcher)")
+    p.add_argument("tables", nargs="+", metavar="TABLE.vpx")
+    p.add_argument("-n", "--dry-run", action="store_true", help="build and verify the patched table, change nothing")
+    p.add_argument("--no-backup", action="store_true", help="do not keep the original (<table>.vpx + backup_suffix)")
+    p.set_defaults(func=cmd_patch)
+
+    p = sub.add_parser("challenges", help="active challenges and your scores")
+    p.add_argument("--json", action="store_true", help="raw API answer")
+    p.set_defaults(func=cmd_challenges)
+
+    p = sub.add_parser("submit", help="submit a score screenshot for the running (or given) table")
+    p.add_argument("table", nargs="?", help="the .vpx (default: the table VPX is running)")
+    p.add_argument("--image", help="screenshot to send (default: run screenshot_command)")
+    p.add_argument("--score", type=int, default=0, help="score (default 0: WoVP reads it from the image)")
+    p.add_argument("--note", help="note for the admins")
+    p.add_argument("--vps", help="VPS game id of the table (default: VPinFE .info or script keywords)")
+    p.add_argument("--challenge", help="challenge id (see `challenges --json`)")
+    p.add_argument("-n", "--dry-run", action="store_true", help="find the challenge and take the screenshot, send nothing")
+    p.set_defaults(func=cmd_submit)
+
+    p = sub.add_parser("logs", help="list or clean telemetry logs")
+    p.add_argument("action", nargs="?", choices=["list", "clean"], default="list")
+    p.add_argument("-n", "--dry-run", action="store_true", help="clean: only show what would be deleted")
+    p.set_defaults(func=cmd_logs)
+
+    a = ap.parse_args()
+    cfg = load_config(a.config)
+    try:
+        return a.func(cfg, a)
+    except Fail as e:
+        if a.cmd == "submit":
+            notify("Score not submitted", str(e), error=True)
+            hook(cfg, "on_error", f"Not submitted: {e}")
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
