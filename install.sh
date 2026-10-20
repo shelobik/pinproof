@@ -5,12 +5,14 @@
 #   curl -fsSL https://raw.githubusercontent.com/shelobik/pinproof/main/install.sh | bash
 #   curl -fsSL https://raw.githubusercontent.com/shelobik/pinproof/main/install.sh | bash -s -- --with-vpxtool
 #
-# Asks for your WoVP API key (if the config has none) and checks it.
+# Asks for your WoVP API key and for the official WoVP Patcher (folder, .zip/.rar or wovp_script.vbs) if the config
+# has none; the telemetry script is copied to ~/.local/share/pinproof/.
 #
 # Options: --with-vpxtool   also install vpxtool (needed for `pinproof patch`)
 #          --dir DIR        install directory (default: ~/.local/bin; /userdata/system/bin on Batocera)
 #          --ref REF        git tag or branch to install (default: main)
 #          --api-key KEY    set the API key without asking
+#          --patcher PATH   official WoVP Patcher (folder, .zip/.rar or wovp_script.vbs) without asking
 set -euo pipefail
 
 REPO=shelobik/pinproof
@@ -19,13 +21,15 @@ REF=main
 WITH_VPXTOOL=0
 DIR=""
 API_KEY=""
+PATCHER=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --with-vpxtool) WITH_VPXTOOL=1 ;;
         --dir) DIR=$2; shift ;;
         --ref) REF=$2; shift ;;
         --api-key) API_KEY=$2; shift ;;
-        -h|--help) sed -n '2,14s/^# \{0,1\}//p' "$0" 2>/dev/null || true; exit 0 ;;
+        --patcher) PATCHER=$2; shift ;;
+        -h|--help) sed -n '2,16s/^# \{0,1\}//p' "$0" 2>/dev/null || true; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -110,6 +114,45 @@ if grep -q '^api_key = ""' "$CONF"; then
         fi
     else
         say "No API key yet: add it to $CONF (api_key = \"...\")."
+    fi
+fi
+
+# WoVP telemetry script (wovp_script.vbs from the official WoVP Patcher; not distributed with pinproof)
+ask_tty() {  # ask_tty PROMPT -> answer on stdout ('' without a terminal)
+    if [ -r /dev/tty ] && { : >/dev/tty; } 2>/dev/null; then
+        printf '%s' "$1" >/dev/tty
+        local a=""; read -r a </dev/tty || a=""; printf '%s' "$a"
+    fi
+}
+find_wovp_script() {  # find_wovp_script PATH -> path of wovp_script.vbs (unpacks .zip/.rar into $tmp)
+    local p=$1 x="$tmp/patcher"
+    case "$p" in
+        *.zip) mkdir -p "$x"; python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$p" "$x" || return 1; p=$x ;;
+        *.rar) mkdir -p "$x"
+               if command -v unrar >/dev/null 2>&1; then unrar x -o+ -inul "$p" "$x/" || return 1
+               elif command -v bsdtar >/dev/null 2>&1; then bsdtar -xf "$p" -C "$x" || return 1
+               elif command -v 7z >/dev/null 2>&1; then 7z x -y -o"$x" "$p" >/dev/null || return 1
+               else say "  can't unpack .rar here (no unrar/bsdtar/7z) — unpack it and give the folder"; return 1; fi
+               p=$x ;;
+    esac
+    if [ -d "$p" ]; then p=$(find "$p" -name wovp_script.vbs -type f 2>/dev/null | head -n1); fi
+    [ -n "$p" ] && [ -f "$p" ] && grep -q 'Sub WoVP_Timer_Timer' "$p" && printf '%s' "$p"
+}
+SCRIPT_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/pinproof
+if [ -n "$PATCHER" ] || grep -q '^patcher = ""' "$CONF"; then
+    [ -n "$PATCHER" ] || PATCHER=$(ask_tty 'Official WoVP Patcher (folder, .zip/.rar or wovp_script.vbs), Enter = later: ')
+    PATCHER=${PATCHER#[\"\']}; PATCHER=${PATCHER%[\"\']}; PATCHER=${PATCHER/#\~/$HOME}
+    if [ -n "$PATCHER" ]; then
+        if src=$(find_wovp_script "$PATCHER"); then
+            mkdir -p "$SCRIPT_DIR"
+            install -m 644 "$src" "$SCRIPT_DIR/wovp_script.vbs"
+            sed -i "s|^patcher = .*|patcher = \"$SCRIPT_DIR/wovp_script.vbs\"           # copied from the official WoVP Patcher|" "$CONF"
+            say "WoVP telemetry script copied to $SCRIPT_DIR/wovp_script.vbs"
+        else
+            say "No WoVP telemetry script (wovp_script.vbs) found in $PATCHER — set \`patcher\` in $CONF later."
+        fi
+    else
+        say "No WoVP Patcher yet: needed for \`pinproof patch\` — run the installer again with --patcher PATH."
     fi
 fi
 

@@ -40,8 +40,10 @@ curl -fsSL https://raw.githubusercontent.com/shelobik/pinproof/main/install.sh |
 ```
 
 Installs `pinproof` (and with `--with-vpxtool` also vpxtool) to `~/.local/bin` — on Batocera to `/userdata/system/bin`,
-which survives updates — creates a config template and asks for your API key (checked right away). Needs Python 3.11+
-and curl or wget. Run it again to update; your config is kept. Options: `--dir DIR`, `--ref TAG`, `--api-key KEY`.
+which survives updates — creates a config template, asks for your API key (checked right away) and for the official
+WoVP Patcher you downloaded (folder, `.zip`/`.rar` or just `wovp_script.vbs`; the script is copied to
+`~/.local/share/pinproof/`). Needs Python 3.11+ and curl or wget. Run it again to update; your config is kept.
+Options: `--dir DIR`, `--ref TAG`, `--api-key KEY`, `--patcher PATH`.
 
 ## Configure
 
