@@ -33,6 +33,16 @@ curl -L https://github.com/francisdb/vpxtool/releases/download/v0.38.0/vpxtool-l
 
 Download the official **WoVP Patcher** (link on the WoVP site / Discord) and unpack it anywhere.
 
+### Without git (e.g. Batocera)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/shelobik/pinproof/main/install.sh | bash -s -- --with-vpxtool
+```
+
+Installs `pinproof` (and with `--with-vpxtool` also vpxtool) to `~/.local/bin` — on Batocera to `/userdata/system/bin`,
+which survives updates — and creates a config template. Needs Python 3.11+ and curl or wget. Run it again to update;
+your config is kept. Options: `--dir DIR`, `--ref TAG`.
+
 ## Configure
 
 `~/.config/pinproof/config.toml` (keep it private, it holds your API key — `chmod 600`):
