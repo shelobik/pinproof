@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.4 — 2026-10-21
+- `pinproof logs --log-dir PATH`: list or clean logs in any folder (e.g. a table's `User` folder).
+
 ## 0.1.3 — 2026-10-20
 - `install.sh` asks for the official WoVP Patcher (folder, .zip/.rar or `wovp_script.vbs`, or `--patcher PATH`) and copies the telemetry script to `~/.local/share/pinproof/`.
 

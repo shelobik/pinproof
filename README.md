@@ -104,6 +104,8 @@ the table name.
 There is no score in the name, so `submit` keeps a hard link of the table's newest log in `log_dir/submitted/` and
 adds a line to `log_dir/submitted.tsv`. Send a log only when the admins ask for it or your score is above their
 threshold. Clean up old logs with `pinproof logs clean` (e.g. weekly from cron or a systemd timer).
+`pinproof logs [clean] --log-dir PATH` works on any other folder, e.g. logs written by another patcher to a table's
+`User` folder.
 
 ## Linux VPX crash (`gamename_fix`)
 
