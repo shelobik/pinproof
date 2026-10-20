@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 API = "https://worldofvirtualpinball.com/api/whsc/v1"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "pinproof" / "config.toml"
 DEFAULTS = {
@@ -35,7 +35,7 @@ DEFAULTS = {
     "vpxtool": "vpxtool",
     "patcher": "",                       # WoVP Patcher folder, or its bin/wovp_script.vbs
     "log_dir": "~/vpin_logs",
-    "screenshot_command": "",            # e.g. "grim {file}" or "spectacle -b -n -f -o {file}"
+    "screenshot_command": "",            # empty = whole desktop with the first tool found (spectacle, grim, scrot, ...)
     "temp_dir": "",                      # where tables are extracted while patching (default: next to the table)
     "backup_suffix": ".bak",             # original kept as <table>.vpx<suffix> (like the official patcher)
     "keep_days": 14,
@@ -360,20 +360,50 @@ def cmd_challenges(cfg, a):
 
 # ---------------------------------------------------------------- submit
 
-def screenshot(cfg, out):
-    cmd = cfg["screenshot_command"]
-    if not cmd:
-        raise Fail("no screenshot: use --image FILE or set `screenshot_command` in the config")
+# Whole-desktop screenshot tools tried in order when screenshot_command is empty (Wayland first if in a Wayland session)
+AUTO_SHOTS_WAYLAND = ["spectacle -b -n -f -o {file}", "grim {file}", "gnome-screenshot -f {file}"]
+AUTO_SHOTS_X11 = ["scrot -o {file}", "maim {file}", "import -window root {file}", "spectacle -b -n -f -o {file}",
+                  "gnome-screenshot -f {file}"]
+
+
+def run_shot(cmd, out):
+    """Run one screenshot command; '' on success, else the reason."""
     parts = [p.replace("{file}", str(out)) for p in shlex.split(cmd)]
     if "{file}" not in cmd:
         parts.append(str(out))
+    if not shutil.which(parts[0]):
+        return f"{parts[0]} not found"
     try:
-        r = subprocess.run(parts, capture_output=True, text=True)
-    except OSError as e:
-        raise Fail(f"screenshot command failed: {e} (use a full path in screenshot_command)")
-    if r.returncode or not out.exists():
-        raise Fail(f"screenshot command failed: {(r.stderr or r.stdout).strip()[-200:]}")
-    return out
+        r = subprocess.run(parts, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return str(e)
+    if r.returncode:
+        return (r.stderr or r.stdout).strip()[-200:] or f"exit {r.returncode}"
+    for _ in range(50):   # some tools (spectacle) hand the job to a running instance and return before the file is written
+        if out.exists() and out.stat().st_size > 0:
+            time.sleep(0.2)
+            return ""
+        time.sleep(0.1)
+    return "no image written"
+
+
+def screenshot(cfg, out):
+    cmd = cfg["screenshot_command"]
+    if cmd:
+        err = run_shot(cmd, out)
+        if err:
+            raise Fail(f"screenshot command failed: {err} (use a full path in screenshot_command)")
+        return out
+    # Default: the whole desktop (on a cabinet that is playfield + backglass/DMD) with the first tool that works
+    tried = AUTO_SHOTS_WAYLAND + AUTO_SHOTS_X11 if os.environ.get("WAYLAND_DISPLAY") else AUTO_SHOTS_X11 + AUTO_SHOTS_WAYLAND
+    reasons = []
+    for c in dict.fromkeys(tried):
+        out.unlink(missing_ok=True)
+        err = run_shot(c, out)
+        if not err:
+            return out
+        reasons.append(f"{c.split()[0]}: {err.splitlines()[-1] if err else '?'}")
+    raise Fail("no screenshot tool worked (" + "; ".join(reasons) + "); set `screenshot_command` or use --image")
 
 
 def mark_log(cfg, vpx, challenge_name, score):

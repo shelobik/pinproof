@@ -40,8 +40,8 @@ curl -fsSL https://raw.githubusercontent.com/shelobik/pinproof/main/install.sh |
 ```
 
 Installs `pinproof` (and with `--with-vpxtool` also vpxtool) to `~/.local/bin` — on Batocera to `/userdata/system/bin`,
-which survives updates — and creates a config template. Needs Python 3.11+ and curl or wget. Run it again to update;
-your config is kept. Options: `--dir DIR`, `--ref TAG`.
+which survives updates — creates a config template and asks for your API key (checked right away). Needs Python 3.11+
+and curl or wget. Run it again to update; your config is kept. Options: `--dir DIR`, `--ref TAG`, `--api-key KEY`.
 
 ## Configure
 
@@ -52,7 +52,8 @@ api_key = "your key from https://worldofvirtualpinball.com/en/challenge/settings
 patcher = "~/Downloads/WoVP_Patcher 1.2.0"     # folder of the official patcher (contains bin/wovp_script.vbs)
 vpxtool = "vpxtool"                            # path, if not in PATH
 log_dir = "~/vpin_logs"                        # where the telemetry writes its logs
-screenshot_command = "spectacle -b -n -f -o {file}"   # or "grim {file}", ...; use full paths if started by a front-end
+# screenshot_command = ""                     # empty: whole desktop with the first tool found (spectacle, grim,
+                                               # gnome-screenshot, scrot, maim, import); or e.g. "grim {file}" (full paths)
 # temp_dir = ""                                # where tables are unpacked while patching (default: next to the table)
 # backup_suffix = ".bak"                       # `patch` keeps the original as TABLE.vpx + this
 # keep_days = 14                               # `logs clean`: delete logs older than this
@@ -84,7 +85,7 @@ Same as the official patcher: two timers cloned from the table's first timer (`W
 **Submit** at the end of a game, while the final score is on screen:
 
 ```sh
-pinproof submit            # the table VPX is running now, screenshot via screenshot_command
+pinproof submit            # the table VPX is running now, screenshot of the whole desktop
 pinproof submit -n         # dry run: find the challenge and take the screenshot, send nothing
 pinproof submit --image shot.png "Some Table.vpx"
 ```

@@ -5,9 +5,12 @@
 #   curl -fsSL https://raw.githubusercontent.com/shelobik/pinproof/main/install.sh | bash
 #   curl -fsSL https://raw.githubusercontent.com/shelobik/pinproof/main/install.sh | bash -s -- --with-vpxtool
 #
+# Asks for your WoVP API key (if the config has none) and checks it.
+#
 # Options: --with-vpxtool   also install vpxtool (needed for `pinproof patch`)
 #          --dir DIR        install directory (default: ~/.local/bin; /userdata/system/bin on Batocera)
 #          --ref REF        git tag or branch to install (default: main)
+#          --api-key KEY    set the API key without asking
 set -euo pipefail
 
 REPO=shelobik/pinproof
@@ -15,12 +18,14 @@ VPXTOOL_VERSION=v0.38.0
 REF=main
 WITH_VPXTOOL=0
 DIR=""
+API_KEY=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --with-vpxtool) WITH_VPXTOOL=1 ;;
         --dir) DIR=$2; shift ;;
         --ref) REF=$2; shift ;;
-        -h|--help) sed -n '2,11s/^# \{0,1\}//p' "$0" 2>/dev/null || true; exit 0 ;;
+        --api-key) API_KEY=$2; shift ;;
+        -h|--help) sed -n '2,14s/^# \{0,1\}//p' "$0" 2>/dev/null || true; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -80,12 +85,32 @@ api_key = ""                                   # https://worldofvirtualpinball.c
 patcher = ""                                   # folder of the official WoVP Patcher (contains bin/wovp_script.vbs)
 vpxtool = "$( [ "$WITH_VPXTOOL" = 1 ] && echo "$DIR/vpxtool" || echo vpxtool )"
 log_dir = "~/vpin_logs"
-screenshot_command = ""                        # e.g. "grim {file}"; use full paths
+screenshot_command = ""                        # empty = whole desktop with the first tool found (spectacle, grim, scrot, ...)
 EOF
     )
-    say "Created $CONF — add your api_key and the patcher folder."
+    say "Created $CONF"
 else
     say "Kept existing $CONF"
+fi
+
+# API key: set it if the config has none (asked on the terminal, also when piped from curl)
+if grep -q '^api_key = ""' "$CONF"; then
+    if [ -z "$API_KEY" ] && [ -r /dev/tty ] && { : >/dev/tty; } 2>/dev/null; then
+        printf 'WoVP API key (https://worldofvirtualpinball.com/en/challenge/settings?tab=general), Enter = later: ' >/dev/tty
+        read -r API_KEY </dev/tty || API_KEY=""
+    fi
+    API_KEY=$(printf '%s' "$API_KEY" | tr -d '[:space:]')
+    if [ -n "$API_KEY" ]; then
+        printf '%s' "$API_KEY" | grep -Eq '^[A-Za-z0-9_-]+$' || fail "the API key has unexpected characters"
+        sed -i "s|^api_key = \"\"|api_key = \"$API_KEY\"|" "$CONF"
+        if who=$("$DIR/pinproof" --config "$CONF" challenges 2>/dev/null | head -n1); then
+            who=${who#*(}; say "API key OK — ${who%)*}"
+        else
+            say "API key saved, but WoVP did not accept it — check it in $CONF"
+        fi
+    else
+        say "No API key yet: add it to $CONF (api_key = \"...\")."
+    fi
 fi
 
 case ":$PATH:" in
