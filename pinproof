@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 API = "https://worldofvirtualpinball.com/api/whsc/v1"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "pinproof" / "config.toml"
 DEFAULTS = {
@@ -360,7 +360,9 @@ def cmd_challenges(cfg, a):
 
 # ---------------------------------------------------------------- submit
 
-# Whole-desktop screenshot tools tried in order when screenshot_command is empty (Wayland first if in a Wayland session)
+# Whole-desktop screenshot tools tried in order when screenshot_command is empty (Wayland first if in a Wayland session).
+# batocera-screenshot goes first: it finds the display itself, so it also works from an SSH shell.
+AUTO_SHOTS_BATOCERA = ["batocera-screenshot --all {file}"]
 AUTO_SHOTS_WAYLAND = ["spectacle -b -n -f -o {file}", "grim {file}", "gnome-screenshot -f {file}"]
 AUTO_SHOTS_X11 = ["scrot -o {file}", "maim {file}", "import -window root {file}", "spectacle -b -n -f -o {file}",
                   "gnome-screenshot -f {file}"]
@@ -395,7 +397,8 @@ def screenshot(cfg, out):
             raise Fail(f"screenshot command failed: {err} (use a full path in screenshot_command)")
         return out
     # Default: the whole desktop (on a cabinet that is playfield + backglass/DMD) with the first tool that works
-    tried = AUTO_SHOTS_WAYLAND + AUTO_SHOTS_X11 if os.environ.get("WAYLAND_DISPLAY") else AUTO_SHOTS_X11 + AUTO_SHOTS_WAYLAND
+    tried = AUTO_SHOTS_BATOCERA + (AUTO_SHOTS_WAYLAND + AUTO_SHOTS_X11 if os.environ.get("WAYLAND_DISPLAY")
+                                   else AUTO_SHOTS_X11 + AUTO_SHOTS_WAYLAND)
     reasons = []
     for c in dict.fromkeys(tried):
         out.unlink(missing_ok=True)
@@ -448,6 +451,11 @@ def cmd_submit(cfg, a):
             jpg = Path(tmp) / "score.jpg"
             if subprocess.run(["magick", str(img), "-quality", "90", str(jpg)]).returncode == 0:
                 img = jpg
+        if a.dry_run and not a.image:   # tmp is deleted on exit — keep a copy to look at
+            keep = log_dir(cfg) / f"pinproof-dryrun{img.suffix}"
+            keep.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(img, keep)
+            img = keep
         print(f"Image:     {img}")
         hook(cfg, "on_screenshot", f"Screenshot taken — submitting to {ch['name']}…")
         if a.dry_run:
@@ -523,7 +531,7 @@ def main():
     p.add_argument("--note", help="note for the admins")
     p.add_argument("--vps", help="VPS game id of the table (default: VPinFE .info or script keywords)")
     p.add_argument("--challenge", help="challenge id (see `challenges --json`)")
-    p.add_argument("-n", "--dry-run", action="store_true", help="find the challenge and take the screenshot, send nothing")
+    p.add_argument("-n", "--dry-run", action="store_true", help="find the challenge and take the screenshot (kept in log_dir), send nothing")
     p.set_defaults(func=cmd_submit)
 
     p = sub.add_parser("logs", help="list or clean telemetry logs")

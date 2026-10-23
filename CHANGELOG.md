@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.5 — 2026-10-23
+- `submit -n` keeps the screenshot as `log_dir/pinproof-dryrun.png` (or `.jpg`) and prints that path; before, the printed `/tmp/…` file was already deleted.
+- `submit` takes the screenshot with `batocera-screenshot --all` on Batocera (works from SSH too); `screenshot_command` is no longer needed there.
+
 ## 0.1.4 — 2026-10-21
 - `pinproof logs --log-dir PATH`: list or clean logs in any folder (e.g. a table's `User` folder).
 

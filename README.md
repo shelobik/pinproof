@@ -54,8 +54,8 @@ api_key = "your key from https://worldofvirtualpinball.com/en/challenge/settings
 patcher = "~/Downloads/WoVP_Patcher 1.2.0"     # folder of the official patcher (contains bin/wovp_script.vbs)
 vpxtool = "vpxtool"                            # path, if not in PATH
 log_dir = "~/vpin_logs"                        # where the telemetry writes its logs
-# screenshot_command = ""                     # empty: whole desktop with the first tool found (spectacle, grim,
-                                               # gnome-screenshot, scrot, maim, import); or e.g. "grim {file}" (full paths)
+# screenshot_command = ""                     # empty: whole desktop with the first tool found (batocera-screenshot,
+                                               # spectacle, grim, gnome-screenshot, scrot, maim, import); or e.g. "grim {file}" (full paths)
 # temp_dir = ""                                # where tables are unpacked while patching (default: next to the table)
 # backup_suffix = ".bak"                       # `patch` keeps the original as TABLE.vpx + this
 # keep_days = 14                               # `logs clean`: delete logs older than this
@@ -88,7 +88,8 @@ Same as the official patcher: two timers cloned from the table's first timer (`W
 
 ```sh
 pinproof submit            # the table VPX is running now, screenshot of the whole desktop
-pinproof submit -n         # dry run: find the challenge and take the screenshot, send nothing
+pinproof submit -n         # dry run: find the challenge and take the screenshot, send nothing;
+                           # the screenshot is kept as log_dir/pinproof-dryrun.png (or .jpg) to check
 pinproof submit --image shot.png "Some Table.vpx"
 ```
 
