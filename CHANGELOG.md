@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.6 — 2026-10-26
+- `submit` keeps every screenshot it sends in `log_dir/screenshots/` (`<date>_<time>_<table>.jpg`); if the upload fails, the error prints the `--image` command to resend it.
+- `logs clean` also deletes screenshots older than `keep_submitted_days`.
+
 ## 0.1.5 — 2026-10-23
 - `submit -n` keeps the screenshot as `log_dir/pinproof-dryrun.png` (or `.jpg`) and prints that path; before, the printed `/tmp/…` file was already deleted.
 - `submit` takes the screenshot with `batocera-screenshot --all` on Batocera (works from SSH too); `screenshot_command` is no longer needed there.

@@ -93,6 +93,9 @@ pinproof submit -n         # dry run: find the challenge and take the screenshot
 pinproof submit --image shot.png "Some Table.vpx"
 ```
 
+Every screenshot `submit` sends is also kept in `log_dir/screenshots/` (`<date>_<time>_<table>.jpg`); if the upload
+fails, the error shows the `pinproof submit --image ...` command to send it again.
+
 Bind `pinproof submit` to a hotkey or a cabinet button. The score is sent as `0` and read from the screenshot by WoVP
 (like VPin Studio does); every score is approved by the WoVP admins. Give `--score N` to send the number yourself.
 On alphanumeric displays wait until your score is shown — the display cycles through other texts after a game.
@@ -104,7 +107,8 @@ the table name.
 **Logs**: the telemetry writes `WoVP_<rom>_<start time>.log` into `log_dir` (one file per table start, every 5 s).
 There is no score in the name, so `submit` keeps a hard link of the table's newest log in `log_dir/submitted/` and
 adds a line to `log_dir/submitted.tsv`. Send a log only when the admins ask for it or your score is above their
-threshold. Clean up old logs with `pinproof logs clean` (e.g. weekly from cron or a systemd timer).
+threshold. Clean up old logs with `pinproof logs clean` (e.g. weekly from cron or a systemd timer); it also deletes
+screenshots older than `keep_submitted_days`.
 `pinproof logs [clean] --log-dir PATH` works on any other folder, e.g. logs written by another patcher to a table's
 `User` folder.
 

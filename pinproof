@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 API = "https://worldofvirtualpinball.com/api/whsc/v1"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "pinproof" / "config.toml"
 DEFAULTS = {
@@ -451,8 +451,11 @@ def cmd_submit(cfg, a):
             jpg = Path(tmp) / "score.jpg"
             if subprocess.run(["magick", str(img), "-quality", "90", str(jpg)]).returncode == 0:
                 img = jpg
-        if a.dry_run and not a.image:   # tmp is deleted on exit — keep a copy to look at
-            keep = log_dir(cfg) / f"pinproof-dryrun{img.suffix}"
+        if not a.image:   # tmp is deleted on exit — keep a copy to look at, or to resend with --image
+            if a.dry_run:
+                keep = log_dir(cfg) / f"pinproof-dryrun{img.suffix}"
+            else:
+                keep = log_dir(cfg) / "screenshots" / f"{datetime.now():%Y-%m-%d_%H%M%S}_{sanitize(vpx.stem)}{img.suffix}"
             keep.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(img, keep)
             img = keep
@@ -463,14 +466,17 @@ def cmd_submit(cfg, a):
             hook(cfg, "on_success", f"Dry run — nothing sent ({ch['name']})")
             return 0
         ctype = "image/jpeg" if img.suffix.lower() in (".jpg", ".jpeg") else "image/png"
-        up = api(cfg, "/scores/submit-photo", files={"file": (img.name, img.read_bytes(), ctype)})
-        photo = (up.get("data") or {}).get("photoTempId")
-        if not photo:
-            raise Fail(f"photo upload: unexpected answer {str(up)[:200]}")
-    api(cfg, "/scores/submit", {
-        "challengeId": ch["id"], "photoTempId": photo, "score": a.score, "note": a.note or "", "playingPlatform": 0,
-        "metadata": {"pinproof-version": VERSION, "vpx-file": vpx.name},
-    })
+        try:
+            up = api(cfg, "/scores/submit-photo", files={"file": (img.name, img.read_bytes(), ctype)})
+            photo = (up.get("data") or {}).get("photoTempId")
+            if not photo:
+                raise Fail(f"photo upload: unexpected answer {str(up)[:200]}")
+            api(cfg, "/scores/submit", {
+                "challengeId": ch["id"], "photoTempId": photo, "score": a.score, "note": a.note or "",
+                "playingPlatform": 0, "metadata": {"pinproof-version": VERSION, "vpx-file": vpx.name},
+            })
+        except Fail as e:
+            raise Fail(f"{e} — screenshot kept, resend with: pinproof submit --image '{img}' '{vpx}'") from None
     log = mark_log(cfg, vpx, ch["name"], a.score)
     notify("Score submitted", f"{ch['name']} — waiting for approval" + (f". Log: {log.name}" if log else ""))
     hook(cfg, "on_success", f"Score submitted — {ch['name']}")
@@ -484,14 +490,16 @@ def cmd_logs(cfg, a):
     if a.action == "clean":
         n = 0
         now = time.time()
-        for folder, days in ((d, cfg["keep_days"]), (d / "submitted", cfg["keep_submitted_days"])):
-            for f in folder.glob("WoVP_*.log") if folder.is_dir() else []:
+        for folder, pattern, days in ((d, "WoVP_*.log", cfg["keep_days"]),
+                                      (d / "submitted", "WoVP_*.log", cfg["keep_submitted_days"]),
+                                      (d / "screenshots", "*", cfg["keep_submitted_days"])):
+            for f in folder.glob(pattern) if folder.is_dir() else []:
                 if now - f.stat().st_mtime > days * 86400:
                     print(("would delete " if a.dry_run else "deleted ") + str(f))
                     if not a.dry_run:
                         f.unlink()
                     n += 1
-        print(f"{n} old log(s)" + (" (dry run)" if a.dry_run else ""))
+        print(f"{n} old file(s)" + (" (dry run)" if a.dry_run else ""))
         return 0
     if not d.is_dir():
         print(f"no logs yet ({d})")
